@@ -1,0 +1,98 @@
+import pandas as pd
+from tqdm import tqdm
+import numpy as np
+import math
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import mean_squared_error
+import xgboost as xgb
+from itertools import product
+import matplotlib.pyplot as plt
+
+data_path = 'D:/Danny/Python3/Kaggle/Santander Value/santander-value-prediction-challenge/'
+out_path = 'D:/Danny/Python3/Kaggle/Santander Value/'
+
+# Read Data
+train = pd.read_csv(data_path+'train.csv.zip', compression='zip')
+test = pd.read_csv(data_path+'test.csv.zip', compression='zip')
+
+
+
+def describe(data):
+    _result = []
+    for col in tqdm(data.columns):
+        NNA = data[col].isnull().sum()/ len(data[col])
+        if col in data.select_dtypes(include=[int, float, np.integer, np.int32, np.int64, np.float, np.float32, np.float64]).columns:
+            _hist = data[col].quantile([0.0,0.25,0.5,0.75,1.0]).tolist()
+            _result.append([col, data[col].dtype, '{:.2%}'.format(NNA), '[{:6.2f} {:6.2f} {:6.2f} {:6.2f} {:6.2f}]'.format(*_hist), '{:6.2f}'.format(data[col].mean())])
+        elif col in data.select_dtypes(include=[object]).columns:
+            _result.append([col, data[col].dtype, '{:.2%}'.format(NNA), np.round(data[col].value_counts(normalize=True)*100, 2).to_dict(), np.nan])
+        else:
+            print(col, data[col].dtype)
+    return pd.DataFrame(data=_result, columns=['var','type','NA','Dist.','Mean'])
+    del _hist, _result, col, NNA
+  
+# Looking into the train set, , there is ~5000 columns and all are numercial with no meanings, no missing records
+# Skip EDA
+    
+# Log transformation
+train_log = np.log(train[train.drop('ID', axis=1).columns]+1)
+target = train_log['target']
+test_log = np.log(test.drop('ID',axis=1)+1)
+
+# Filter on correlation >= 0.1
+tmp = train_log.corr()
+train_log = train_log.drop('target',axis=1)
+target_corr = tmp['target']
+high_corr_columns = list(target_corr[np.abs(target_corr)>0.1].index)
+high_corr_columns.remove('target')
+
+kmeans = KMeans(n_clusters=10, random_state=828).fit(train_log)
+
+
+# Fit PCA and explained variance = 0.9
+pca = PCA().fit(train_log[(high_corr_columns)])
+pca_selected = np.where(np.cumsum(pca.explained_variance_ratio_)<0.90)[0][-1]
+train_x_pca = pca.transform(train_log[high_corr_columns])[:,:pca_selected+1]
+test_x_pca = pca.transform(test_log[high_corr_columns])[:,:pca_selected+1]
+
+dtrain = xgb.DMatrix(train_x_pca, target)
+dtest = xgb.DMatrix(test_x_pca)
+
+
+param_list = {
+        'max_depth':3,
+        'eta':0.1, 
+        'objective':'reg:linear',
+        'random_state':828, 
+        'subsample':1.0,
+        'colsample_bytree':1.0
+        }
+nfolds=4
+num_rounds = 100
+cv_result = xgb.cv(param_list, dtrain, num_boost_round=num_rounds,
+       nfold=nfolds, metrics=['rmse'], early_stopping_rounds=10, seed=828)
+
+plt.figure(figsize=(12,9))
+plt.plot(np.arange(len(cv_result))+1, cv_result['train-rmse-mean'], 'r-', label='Train set RMSE')
+plt.plot(np.arange(len(cv_result))+1, cv_result['test-rmse-mean'], 'b-', label='Test set RMSE')
+plt.ylabel('RMSE')
+plt.xlabel('Num. of Rounds')
+plt.legend(loc='best')
+plt.show()
+
+watchlist = [(dtrain, 'dtrain')]
+num_rounds = len(cv_result)+1
+evals_result = dict()
+rgr = xgb.train(param_list, dtrain, num_boost_round=num_rounds, evals=watchlist,evals_result=evals_result)
+rgr.save_model(out_path+'XGBM.model')
+
+# Erro Analysis
+tmp_df = pd.DataFrame(data={'cluster':kmeans.labels_, 'target':target, 'prediction':rgr.predict(dtrain)})
+tmp_df['error'] = mean_squared_error(target, rgr.predict(dtrain))
+tmp_df.groupby('cluster')[['target','error']].agg({'target':'mean','error':'mean'})
+
+# Apply PCA on test and make prediction
+test_x_pca = pca.transform(test_log[(high_corr_columns)])[:,:pca_selected+1]
+prediction = pd.DataFrame(data={'ID':test['ID'], 'target':np.exp(rgr.predict(dtest))-1})
+prediction.to_csv(out_path+'XGBM_01.csv', index=False)
